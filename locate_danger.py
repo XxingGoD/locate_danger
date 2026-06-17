@@ -80,20 +80,37 @@ class DangerRuleManager:
     def import_rules(self, raw_rules):
         normalized_rules = {}
 
-        if not isinstance(raw_rules, dict):
+        if isinstance(raw_rules, list):
+            iterable = []
+            for rule in raw_rules:
+                if not isinstance(rule, dict):
+                    continue
+                copied = dict(rule)
+                copied["name"] = rule.get("name", "")
+                iterable.append(copied)
+        elif isinstance(raw_rules, dict):
+            iterable = []
+            for name, rule in raw_rules.items():
+                if not isinstance(rule, dict):
+                    rule = {}
+                copied = dict(rule)
+                copied["name"] = name
+                iterable.append(copied)
+        else:
+            self.rules = {}
             return
 
-        for name, rule in raw_rules.items():
-            normalized_name = self.normalize_name(name)
+        for raw_rule in iterable:
+            if not isinstance(raw_rule, dict):
+                continue
+
+            normalized_name = self.normalize_name(raw_rule.get("name", ""))
             if not normalized_name:
                 continue
 
-            if not isinstance(rule, dict):
-                rule = {}
-
-            category = str(rule.get("category", DEFAULT_RULE_CATEGORY)).strip() or DEFAULT_RULE_CATEGORY
-            severity = str(rule.get("severity", DEFAULT_RULE_SEVERITY)).strip().lower() or DEFAULT_RULE_SEVERITY
-            arg_filter = str(rule.get("arg_filter", DEFAULT_ARG_FILTER)).strip().lower() or DEFAULT_ARG_FILTER
+            category = str(raw_rule.get("category", DEFAULT_RULE_CATEGORY)).strip() or DEFAULT_RULE_CATEGORY
+            severity = str(raw_rule.get("severity", DEFAULT_RULE_SEVERITY)).strip().lower() or DEFAULT_RULE_SEVERITY
+            arg_filter = str(raw_rule.get("arg_filter", DEFAULT_ARG_FILTER)).strip().lower() or DEFAULT_ARG_FILTER
             if severity not in SEVERITY_RANK:
                 severity = DEFAULT_RULE_SEVERITY
             if arg_filter not in ARG_FILTER_LABELS:
@@ -701,6 +718,8 @@ class DangerState:
         self.minimum_severity = "low"
         self.plugin_breakpoints = set()
         self.ignored_callsites = set()
+        self._pending_pseudocode_refresh_funcs = set()
+        self._refresh_timer = None
         self.chooser = None
         self.rule_chooser = None
         self.ignored_call_chooser = None
@@ -708,19 +727,23 @@ class DangerState:
         self._load_ignored_calls_from_idb()
 
     def rescan(self):
+        previous_funcs = set(self.calls_by_func.keys())
         self._clear_plugin_breakpoints()
         self.targets, calls, calls_by_func = self.scanner.collect()
         self.calls, self.calls_by_func = self._filter_ignored_calls(calls, calls_by_func)
         self.function_rows = self._build_function_rows()
+        self._pending_pseudocode_refresh_funcs = previous_funcs | set(self.calls_by_func.keys())
         self._apply_plugin_breakpoints()
         self._log_summary()
 
     def clear_scan_results(self):
+        previous_funcs = set(self.calls_by_func.keys())
         self._clear_plugin_breakpoints()
         self.targets = []
         self.calls = []
         self.calls_by_func = {}
         self.function_rows = []
+        self._pending_pseudocode_refresh_funcs = previous_funcs
 
     def refresh_after_rule_change(self):
         if not self.enabled:
@@ -734,11 +757,7 @@ class DangerState:
                 self._log_summary()
 
             self.refresh_current_pseudocode()
-            if self.chooser is not None:
-                try:
-                    self.chooser.Refresh()
-                except Exception:
-                    pass
+            self._schedule_chooser_refresh()
         except Exception as exc:
             log(f"automatic rescan failed: {exc}")
 
@@ -765,7 +784,14 @@ class DangerState:
             self.rule_manager,
         )
 
-    def add_or_update_rule(self, name, category, severity, previous_name=None, arg_filter=DEFAULT_ARG_FILTER):
+    def add_or_update_rule(
+        self,
+        name,
+        category,
+        severity,
+        previous_name=None,
+        arg_filter=DEFAULT_ARG_FILTER,
+    ):
         normalized_name = self.rule_manager.normalize_name(name)
         if not normalized_name:
             ida_kernwin.warning("Function name is empty")
@@ -890,27 +916,46 @@ class DangerState:
         return True
 
     def refresh_current_pseudocode(self):
-        widget = ida_kernwin.get_current_widget()
-        if widget is None:
-            return
+        refreshed = False
 
-        if ida_kernwin.get_widget_type(widget) != ida_kernwin.BWN_PSEUDOCODE:
-            return
+        open_funcs = set(self._pending_pseudocode_refresh_funcs) | {call["caller_func_ea"] for call in self.calls}
+        current_widget = ida_kernwin.get_current_widget()
+        if current_widget is not None and ida_kernwin.get_widget_type(current_widget) == ida_kernwin.BWN_PSEUDOCODE:
+            current_vu = ida_hexrays.get_widget_vdui(current_widget)
+            if current_vu is not None:
+                try:
+                    current_vu.refresh_view(True)
+                    refreshed = True
+                except Exception:
+                    pass
 
-        vu = ida_hexrays.get_widget_vdui(widget)
-        if vu is None:
-            return
+        for func_ea in sorted(open_funcs):
+            try:
+                vu = ida_hexrays.open_pseudocode(func_ea, ida_hexrays.OPF_REUSE)
+            except Exception:
+                vu = None
+            if vu is None:
+                continue
+            try:
+                vu.refresh_view(True)
+                refreshed = True
+            except Exception:
+                continue
 
-        try:
-            vu.refresh_view(True)
-        except Exception:
-            ida_kernwin.refresh_idaview_anyway()
+        self._pending_pseudocode_refresh_funcs = set()
 
-    def disable(self):
+        if not refreshed:
+            try:
+                ida_kernwin.mark_builtin_widget_by_id(ida_kernwin.BWN_PSEUDOCODE, True)
+            except Exception:
+                ida_kernwin.refresh_idaview_anyway()
+
+    def disable(self, shutting_down=False):
         self.enabled = False
         self.clear_scan_results()
-        self.refresh_current_pseudocode()
         self.close_choosers()
+        if not shutting_down:
+            self.refresh_current_pseudocode()
         log("plugin disabled")
 
     def enable(self):
@@ -919,6 +964,8 @@ class DangerState:
         log("plugin enabled")
 
     def close_choosers(self):
+        self._cancel_scheduled_refresh()
+
         if self.chooser is not None:
             try:
                 self.chooser.Close()
@@ -936,6 +983,78 @@ class DangerState:
                 self.ignored_call_chooser.Close()
             except Exception:
                 pass
+
+    def _refresh_open_choosers(self):
+        self._refresh_rule_chooser()
+        self._reopen_call_chooser()
+        self._reopen_ignored_call_chooser()
+
+    def _refresh_rule_chooser(self):
+        if self.rule_chooser is None:
+            return
+
+        try:
+            force_refresh = getattr(self.rule_chooser, "force_refresh", None)
+            if callable(force_refresh):
+                force_refresh()
+            else:
+                self.rule_chooser.Refresh()
+        except Exception:
+            pass
+
+    def _reopen_call_chooser(self):
+        if self.chooser is None:
+            return
+
+        try:
+            self.chooser.Close()
+        except Exception:
+            pass
+
+        self.chooser = DangerCallChooser(self)
+        try:
+            self.chooser.Show()
+        except Exception:
+            pass
+
+    def _reopen_ignored_call_chooser(self):
+        if self.ignored_call_chooser is None:
+            return
+
+        try:
+            self.ignored_call_chooser.Close()
+        except Exception:
+            pass
+
+        self.ignored_call_chooser = IgnoredCallChooser(self)
+        try:
+            self.ignored_call_chooser.Show()
+        except Exception:
+            pass
+
+    def _schedule_chooser_refresh(self):
+        if self._refresh_timer is not None:
+            return
+
+        def _run_refresh():
+            self._refresh_timer = None
+            self._refresh_open_choosers()
+            return -1
+
+        try:
+            self._refresh_timer = ida_kernwin.register_timer(0, _run_refresh)
+        except Exception:
+            self._refresh_open_choosers()
+
+    def _cancel_scheduled_refresh(self):
+        if self._refresh_timer is None:
+            return
+
+        try:
+            ida_kernwin.unregister_timer(self._refresh_timer)
+        except Exception:
+            pass
+        self._refresh_timer = None
 
     def _apply_plugin_breakpoints(self):
         for call in self.calls:
@@ -1150,7 +1269,6 @@ class DangerCallChooser(ida_kernwin.Choose):
 
     def __init__(self, state):
         self.state = state
-        self.items = []
         columns = [
             ["Callsite", 12],
             ["Caller", 28],
@@ -1170,39 +1288,39 @@ class DangerCallChooser(ida_kernwin.Choose):
             ),
             embedded=False,
         )
-        self.refresh_items()
 
-    def refresh_items(self):
-        self.items = []
-        for call in self.state.get_all_calls():
-            self.items.append(
-                [
-                    f"0x{call['callsite_ea']:X}",
-                    call["caller_func_name"],
-                    call["callee_normalized_name"],
-                    call["risk_category"],
-                    call["severity"],
-                    call["source"],
-                    call.get("summary", ""),
-                ]
-            )
+    def _rows(self):
+        return self.state.get_all_calls()
 
     def Show(self, modal=False):
-        self.refresh_items()
         return super().Show(modal)
 
+    def force_refresh(self):
+        try:
+            self.Refresh()
+        except Exception:
+            pass
+
     def OnGetSize(self):
-        return len(self.items)
+        return len(self._rows())
 
     def OnGetLine(self, n):
-        return self.items[n]
+        call = self._rows()[n]
+        return [
+            f"0x{call['callsite_ea']:X}",
+            call["caller_func_name"],
+            call["callee_normalized_name"],
+            call["risk_category"],
+            call["severity"],
+            call["source"],
+            call.get("summary", ""),
+        ]
 
     def OnRefresh(self, n):
-        self.refresh_items()
         return n
 
     def OnSelectLine(self, n):
-        calls = self.state.get_all_calls()
+        calls = self._rows()
         if n < 0 or n >= len(calls):
             return (ida_kernwin.Choose.NOTHING_CHANGED,)
 
@@ -1211,7 +1329,7 @@ class DangerCallChooser(ida_kernwin.Choose):
         return (ida_kernwin.Choose.NOTHING_CHANGED,)
 
     def OnDeleteLine(self, sel):
-        calls = self.state.get_all_calls()
+        calls = self._rows()
         if sel < 0 or sel >= len(calls):
             return (ida_kernwin.Choose.NOTHING_CHANGED,)
 
@@ -1219,7 +1337,6 @@ class DangerCallChooser(ida_kernwin.Choose):
         if not self.state.ignore_callsite(call["callsite_ea"]):
             return (ida_kernwin.Choose.NOTHING_CHANGED,)
 
-        self.refresh_items()
         return [ida_kernwin.Choose.ALL_CHANGED] + self.adjust_last_item(sel)
 
     def _jump_to_call(self, call):
@@ -1263,6 +1380,12 @@ class IgnoredCallChooser(ida_kernwin.Choose):
 
     def _rows(self):
         return self.state.get_ignored_call_rows()
+
+    def force_refresh(self):
+        try:
+            self.Refresh()
+        except Exception:
+            pass
 
     def OnGetSize(self):
         return len(self._rows())
@@ -1446,7 +1569,10 @@ class DangerRuleChooser(ida_kernwin.Choose):
             return (ida_kernwin.Choose.NOTHING_CHANGED,)
 
         if not self.state.add_or_update_rule(
-            rule["name"], rule["category"], rule["severity"], arg_filter=rule.get("arg_filter", DEFAULT_ARG_FILTER)
+            rule["name"],
+            rule["category"],
+            rule["severity"],
+            arg_filter=rule.get("arg_filter", DEFAULT_ARG_FILTER),
         ):
             return (ida_kernwin.Choose.NOTHING_CHANGED,)
 
@@ -1895,7 +2021,7 @@ class LocateSpacePlugin(idaapi.plugin_t):
 
         if self.state is not None:
             try:
-                self.state.disable()
+                self.state.disable(shutting_down=True)
             except Exception:
                 pass
 
