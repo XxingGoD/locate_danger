@@ -33,6 +33,8 @@ MENU_PATH_CANDIDATES = (
 )
 ACTION_SCAN = "locatespace:scan"
 ACTION_EDIT_RULES = "locatespace:edit_rules"
+ACTION_DISABLE = "locatespace:disable"
+ACTION_ENABLE = "locatespace:enable"
 SEVERITY_RANK = {
     "critical": 4,
     "high": 3,
@@ -584,6 +586,35 @@ class DangerState:
         except Exception:
             ida_kernwin.refresh_idaview_anyway()
 
+    def disable(self):
+        self.enabled = False
+        self._clear_plugin_breakpoints()
+        self.targets = []
+        self.calls = []
+        self.calls_by_func = {}
+        self.function_rows = []
+        self.refresh_current_pseudocode()
+        self.close_choosers()
+        log("plugin disabled")
+
+    def enable(self):
+        self.enabled = True
+        self.refresh_current_pseudocode()
+        log("plugin enabled")
+
+    def close_choosers(self):
+        if self.chooser is not None:
+            try:
+                self.chooser.Close()
+            except Exception:
+                pass
+
+        if self.rule_chooser is not None:
+            try:
+                self.rule_chooser.Close()
+            except Exception:
+                pass
+
     def _apply_plugin_breakpoints(self):
         for call in self.calls:
             ea = call["callsite_ea"]
@@ -894,7 +925,6 @@ Locatespace rule
 class DangerRuleChooser(ida_kernwin.Choose):
     def __init__(self, state):
         self.state = state
-        self.items = []
         columns = [
             ["Function", 24],
             ["Category", 18],
@@ -912,27 +942,28 @@ class DangerRuleChooser(ida_kernwin.Choose):
             ),
             embedded=False,
         )
-        self.refresh_items()
 
-    def refresh_items(self):
-        self.items = [
-            [row["name"], row["category"], row["severity"]]
-            for row in self.state.get_rule_rows()
-        ]
+    def _rows(self):
+        return self.state.get_rule_rows()
 
     def Show(self, modal=False):
-        self.refresh_items()
         return super().Show(modal)
 
+    def force_refresh(self):
+        try:
+            self.Refresh()
+        except Exception:
+            pass
+
     def OnGetSize(self):
-        return len(self.items)
+        return len(self._rows())
 
     def OnGetLine(self, n):
-        return self.items[n]
+        row = self._rows()[n]
+        return [row["name"], row["category"], row["severity"]]
 
     def OnRefresh(self, n):
-        self.refresh_items()
-        return n
+        return None
 
     def OnInsertLine(self, sel):
         rule = self.state.prompt_rule()
@@ -942,25 +973,31 @@ class DangerRuleChooser(ida_kernwin.Choose):
         if not self.state.add_or_update_rule(rule["name"], rule["category"], rule["severity"]):
             return (ida_kernwin.Choose.NOTHING_CHANGED,)
 
-        self.refresh_items()
-        return (ida_kernwin.Choose.ALL_CHANGED, max(0, len(self.items) - 1))
+        self.force_refresh()
+        row_count = len(self._rows())
+        return (ida_kernwin.Choose.ALL_CHANGED, max(0, row_count - 1))
 
     def OnDeleteLine(self, sel):
-        if sel < 0 or sel >= len(self.items):
+        rows = self._rows()
+        if sel < 0 or sel >= len(rows):
             return (ida_kernwin.Choose.NOTHING_CHANGED,)
 
-        rule_name = self.items[sel][0]
+        rule_name = rows[sel]["name"]
         if not self.state.remove_rule(rule_name):
             return (ida_kernwin.Choose.NOTHING_CHANGED,)
 
-        self.refresh_items()
+        self.force_refresh()
         return [ida_kernwin.Choose.ALL_CHANGED] + self.adjust_last_item(sel)
 
     def OnEditLine(self, sel):
-        if sel < 0 or sel >= len(self.items):
+        rows = self._rows()
+        if sel < 0 or sel >= len(rows):
             return (ida_kernwin.Choose.NOTHING_CHANGED,)
 
-        current_name, current_category, current_severity = self.items[sel]
+        current_row = rows[sel]
+        current_name = current_row["name"]
+        current_category = current_row["category"]
+        current_severity = current_row["severity"]
         rule = self.state.prompt_rule(current_name, current_category, current_severity)
         if rule is None:
             return (ida_kernwin.Choose.NOTHING_CHANGED,)
@@ -970,9 +1007,10 @@ class DangerRuleChooser(ida_kernwin.Choose):
         ):
             return (ida_kernwin.Choose.NOTHING_CHANGED,)
 
-        self.refresh_items()
-        for index, item in enumerate(self.items):
-            if item[0] == self.state.rule_manager.normalize_name(rule["name"]):
+        self.force_refresh()
+        normalized_name = self.state.rule_manager.normalize_name(rule["name"])
+        for index, item in enumerate(self._rows()):
+            if item["name"] == normalized_name:
                 return (ida_kernwin.Choose.ALL_CHANGED, index)
 
         return (ida_kernwin.Choose.ALL_CHANGED, sel)
@@ -1224,15 +1262,18 @@ def create_locatespace_runtime():
 
 
 class LocatespaceActionHandler(ida_kernwin.action_handler_t):
-    def __init__(self, callback):
+    def __init__(self, callback, update_callback=None):
         super().__init__()
         self.callback = callback
+        self.update_callback = update_callback
 
     def activate(self, ctx):
         self.callback()
         return 1
 
     def update(self, ctx):
+        if self.update_callback is not None:
+            return self.update_callback(ctx)
         return ida_kernwin.AST_ENABLE_ALWAYS
 
 
@@ -1285,6 +1326,9 @@ class LocateSpacePlugin(idaapi.plugin_t):
     def _scan_now(self):
         if self.state is None:
             return
+        if not self.state.enabled:
+            log("plugin is disabled")
+            return
 
         try:
             self.state.rescan()
@@ -1298,15 +1342,38 @@ class LocateSpacePlugin(idaapi.plugin_t):
         if self.state is None:
             log("plugin state is not ready")
             return
+        if not self.state.enabled:
+            log("plugin is disabled")
+            return
 
         self.state.show_rule_manager()
+
+    def disable_plugin(self):
+        if self.state is None:
+            log("plugin state is not ready")
+            return
+        if not self.state.enabled:
+            log("plugin is already disabled")
+            return
+
+        self.state.disable()
+
+    def enable_plugin(self):
+        if self.state is None:
+            log("plugin state is not ready")
+            return
+        if self.state.enabled:
+            log("plugin is already enabled")
+            return
+
+        self.state.enable()
 
     def term(self):
         self._unregister_actions()
 
         if self.state is not None:
             try:
-                self.state._clear_plugin_breakpoints()
+                self.state.disable()
             except Exception:
                 pass
 
@@ -1325,16 +1392,30 @@ class LocateSpacePlugin(idaapi.plugin_t):
             ACTION_SCAN,
             "Locatespace: Scan dangerous calls",
             lambda: self.run(0),
+            update_callback=self._update_enabled_only,
         )
         self._register_action(
             ACTION_EDIT_RULES,
             "Locatespace: Edit dangerous functions",
             self.edit_rules,
+            update_callback=self._update_enabled_only,
+        )
+        self._register_action(
+            ACTION_DISABLE,
+            "Locatespace: Disable plugin",
+            self.disable_plugin,
+            update_callback=self._update_enabled_only,
+        )
+        self._register_action(
+            ACTION_ENABLE,
+            "Locatespace: Enable plugin",
+            self.enable_plugin,
+            update_callback=self._update_disabled_only,
         )
 
-    def _register_action(self, name, label, callback):
+    def _register_action(self, name, label, callback, update_callback=None):
         ida_kernwin.unregister_action(name)
-        handler = LocatespaceActionHandler(callback)
+        handler = LocatespaceActionHandler(callback, update_callback=update_callback)
         desc = ida_kernwin.action_desc_t(name, label, handler)
         if not ida_kernwin.register_action(desc):
             log(f"failed to register action: {name}")
@@ -1349,7 +1430,7 @@ class LocateSpacePlugin(idaapi.plugin_t):
         self.action_handlers[name] = handler
 
     def _unregister_actions(self):
-        for name in (ACTION_SCAN, ACTION_EDIT_RULES):
+        for name in (ACTION_SCAN, ACTION_EDIT_RULES, ACTION_DISABLE, ACTION_ENABLE):
             attached_path = self.action_menu_paths.get(name)
             if attached_path is not None:
                 try:
@@ -1380,6 +1461,16 @@ class LocateSpacePlugin(idaapi.plugin_t):
                 continue
 
         return None
+
+    def _update_enabled_only(self, ctx):
+        if self.state is None:
+            return ida_kernwin.AST_DISABLE
+        return ida_kernwin.AST_ENABLE_ALWAYS if self.state.enabled else ida_kernwin.AST_DISABLE
+
+    def _update_disabled_only(self, ctx):
+        if self.state is None:
+            return ida_kernwin.AST_DISABLE
+        return ida_kernwin.AST_ENABLE_ALWAYS if not self.state.enabled else ida_kernwin.AST_DISABLE
 
 
 def PLUGIN_ENTRY():
